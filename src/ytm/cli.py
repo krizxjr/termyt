@@ -64,12 +64,12 @@ class Session:
     def _play_index(self, i: int) -> None:
         self.index = i
         self._generation += 1
-        proc_before = self.player._proc
         title = self.player.play(self.queue[i])
+        proc = self.player._proc  # the NEW process is the one to watch
         console.print(f"[green]▶[/green] {i + 1}/{len(self.queue)} {title}")
         t = threading.Thread(
             target=self._watch,
-            args=(self._generation, proc_before, self._next_track),
+            args=(self._generation, proc, self._next_track),
             daemon=True,
         )
         t.start()
@@ -147,9 +147,13 @@ class Session:
                 self.stop_current()
                 self.do_search()
             elif key == "=" or key == "+":
+                self._generation += 1  # set_volume restarts mpv; don't
+                # let the currently-waiting watcher treat that as a
+                # natural song end
                 self.player.set_volume(min(100, self.player._volume + 10))
                 console.print(f"[dim]volume → {self.player._volume}[/dim]")
             elif key == "-":
+                self._generation += 1
                 self.player.set_volume(max(0, self.player._volume - 10))
                 console.print(f"[dim]volume → {self.player._volume}[/dim]")
 

@@ -74,7 +74,8 @@ class Player:
                 "--no-terminal",
                 f"--volume={self._volume}",
                 stream_url,
-            ]
+            ],
+            stderr=subprocess.DEVNULL,  # PipeWire's harmless config chatter
         )
         self._current = entry
         self._paused = False

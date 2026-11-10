@@ -51,6 +51,9 @@ def main() -> None:
     console.print(f"[bold]ytm[/bold] {__version__} — interactive session\n")
     try:
         Session().start()
+    except KeyboardInterrupt:
+        # Ctrl+C at a text prompt (Search:…) quits instead of crashing.
+        console.print("[red]Stopped by you.[/red]")
     finally:
         console.print("[bold]Bye![/bold]")
 
