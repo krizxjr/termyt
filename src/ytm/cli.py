@@ -173,15 +173,16 @@ class Session:
                 self.stop_current()
                 self.do_search()
             elif key in ("=", "+"):
-                self._generation += 1  # set_volume restarts mpv; don't
-                # let the currently-waiting watcher treat that as a
-                # natural song end
-                self.player.set_volume(min(100, self.player._volume + 10))
-                self._start_watcher()  # watch the freshly restarted proc
+                self._generation += 1  # old watcher is stale either way:
+                # IPC path keeps the same proc (watcher must be replaced
+                # because its generation no longer matches); fallback path
+                # restarts the proc. Both need a fresh watcher.
+                self.player.set_volume(self.player._volume + 10)
+                self._start_watcher()
                 console.print(f"[dim]volume → {self.player._volume}[/dim]")
             elif key == "-":
                 self._generation += 1
-                self.player.set_volume(max(0, self.player._volume - 10))
+                self.player.set_volume(self.player._volume - 10)
                 self._start_watcher()
                 console.print(f"[dim]volume → {self.player._volume}[/dim]")
 
