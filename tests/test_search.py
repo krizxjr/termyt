@@ -12,7 +12,7 @@ from ytm.search import format_duration
 
 def test_version_is_a_string():
     assert isinstance(ytm.__version__, str)
-    assert ytm.__version__ == "0.1.0"
+    assert ytm.__version__ == "0.2.0"
 
 
 def test_imports_smoke():
