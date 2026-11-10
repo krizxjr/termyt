@@ -20,9 +20,10 @@ import readchar
 from rich.console import Console
 from rich.table import Table
 
+from ytm import state
+from ytm.mpris import Reporter
 from ytm.player import Player
 from ytm.search import format_duration, search
-from ytm import state
 
 console = Console()
 
@@ -46,6 +47,46 @@ class Session:
         self._watcher: threading.Thread | None = None
         self._generation = 0  # bumped on every manual action; see _watch
         self._stopping = False  # True when the user quit the session
+        self.reporter = self._start_mpris()
+
+    # -- desktop (MPRIS) integration ---------------------------------------
+
+    def _start_mpris(self) -> Reporter | None:
+        """Desktop media-keys/now-playing via MPRIS; optional at runtime."""
+        actions = {
+            "play": self.player.resume,
+            "pause": self.player.pause,
+            "toggle": lambda: self.player.toggle(),
+            "next": lambda: (self.stop_current(), self._next_track()),
+            "previous": lambda: (self.stop_current(), self._previous_track()),
+            "stop": self.stop_current,
+            "quit": self._quit_from_desktop,
+        }
+        try:
+            return Reporter(
+                actions=actions,
+                set_volume=self._set_volume_from_desktop,
+            )
+        except RuntimeError as exc:  # no session bus: run desktop-less
+            console.print(f"[dim]Desktop integration unavailable ({exc})[/dim]")
+            return None
+
+    def _set_volume_from_desktop(self, volume: int) -> None:
+        """Desktop-sent volume: prefer instant IPC, otherwise store only."""
+        clamped = max(0, min(100, volume))
+        if self.player._ipc_path and self.player._ipc_command(
+            ["set_property", "volume", clamped]
+        ):
+            self.player._volume = clamped
+            self.reporter.set_state(volume=clamped) if self.reporter else None
+        else:
+            self.player._volume = clamped  # live for the next play
+
+    def _quit_from_desktop(self) -> None:
+        console.print("[dim]Quit requested from the desktop.[/dim]")
+        self._stopping = True
+        self.player.stop()
+        # The key loop notices the flag on its next keypress; Ctrl+C also works.
 
     # -- playback plumbing -------------------------------------------------
 
@@ -68,7 +109,18 @@ class Session:
         self._generation += 1
         title = self.player.play(self.queue[i])
         console.print(f"[green]▶[/green] {i + 1}/{len(self.queue)} {title}")
+        self._mpris_status("Playing")
         self._start_watcher()
+
+    def _mpris_status(self, status: str) -> None:
+        if self.reporter:
+            self.reporter.set_state(
+                status=status,
+                title=self.player.current["title"] if self.player.current else None,
+                url=self.player.current["url"] if self.player.current else None,
+                volume=self.player._volume,
+                has_track=bool(self.player.current),
+            )
 
     def _start_watcher(self) -> None:
         """Spawn the thread that auto-advances when the current mpv exits.
@@ -163,6 +215,7 @@ class Session:
                 self._generation += 1
                 self.player.toggle()
                 console.print("[dim]paused[/dim]" if not was else "[dim]resumed[/dim]")
+                self._mpris_status("Paused" if not was else "Playing")
             elif key == "n":
                 self.stop_current()
                 self._next_track()
@@ -179,21 +232,28 @@ class Session:
                 # restarts the proc. Both need a fresh watcher.
                 self.player.set_volume(self.player._volume + 10)
                 self._start_watcher()
+                if self.reporter:
+                    self.reporter.set_state(volume=self.player._volume)
                 console.print(f"[dim]volume → {self.player._volume}[/dim]")
             elif key == "-":
                 self._generation += 1
                 self.player.set_volume(self.player._volume - 10)
                 self._start_watcher()
+                if self.reporter:
+                    self.reporter.set_state(volume=self.player._volume)
                 console.print(f"[dim]volume → {self.player._volume}[/dim]")
 
     def stop_current(self) -> None:
         """Manual navigation: bump the generation so the old watcher quits."""
         self._generation += 1
         self.player.stop()
+        self._mpris_status("Stopped")
 
     def quit(self) -> None:
         """Persist the session, then shut down playback."""
         state.save(self.queue, index=self.index, volume=self.player._volume)
+        if self.reporter:
+            self.reporter.stop()
         self._stopping = True
         self._generation += 1
         self.player.stop()
