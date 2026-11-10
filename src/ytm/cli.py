@@ -59,17 +59,29 @@ class Session:
         if proc is not None:
             proc.wait()
         if generation == self._generation and not self._stopping:
+            console.print("[dim](track finished)[/dim]")
             on_end()
 
     def _play_index(self, i: int) -> None:
         self.index = i
         self._generation += 1
         title = self.player.play(self.queue[i])
-        proc = self.player._proc  # the NEW process is the one to watch
         console.print(f"[green]▶[/green] {i + 1}/{len(self.queue)} {title}")
+        self._start_watcher()
+
+    def _start_watcher(self) -> None:
+        """Spawn the thread that auto-advances when the current mpv exits.
+
+        The watcher pairs with the generation counter: whenever something
+        replaces playback (skip, volume restart, quit), the generation is
+        bumped first so the stale watcher's wake-up matches nothing and it
+        exits silently instead of acting on a dead proc.
+        """
+        gen = self._generation
+        proc = self.player._proc  # the NEW process is the one to watch
         t = threading.Thread(
             target=self._watch,
-            args=(self._generation, proc, self._next_track),
+            args=(gen, proc, self._next_track),
             daemon=True,
         )
         t.start()
@@ -146,18 +158,27 @@ class Session:
             elif key == "s":
                 self.stop_current()
                 self.do_search()
-            elif key == "=" or key == "+":
+            elif key in ("=", "+"):
                 self._generation += 1  # set_volume restarts mpv; don't
                 # let the currently-waiting watcher treat that as a
                 # natural song end
                 self.player.set_volume(min(100, self.player._volume + 10))
+                self._start_watcher()  # watch the freshly restarted proc
                 console.print(f"[dim]volume → {self.player._volume}[/dim]")
             elif key == "-":
                 self._generation += 1
                 self.player.set_volume(max(0, self.player._volume - 10))
+                self._start_watcher()
                 console.print(f"[dim]volume → {self.player._volume}[/dim]")
 
     def stop_current(self) -> None:
         """Manual navigation: bump the generation so the old watcher quits."""
+        self._generation += 1
+        self.player.stop()
+
+    def quit(self) -> None:
+        """Shut down playback for real — the missing piece that let mpv
+        keep playing in the background after we exited."""
+        self._stopping = True
         self._generation += 1
         self.player.stop()

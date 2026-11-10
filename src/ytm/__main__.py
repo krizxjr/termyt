@@ -49,12 +49,14 @@ def main() -> None:
         return
 
     console.print(f"[bold]ytm[/bold] {__version__} — interactive session\n")
+    session = Session()
     try:
-        Session().start()
+        session.start()
     except KeyboardInterrupt:
         # Ctrl+C at a text prompt (Search:…) quits instead of crashing.
         console.print("[red]Stopped by you.[/red]")
     finally:
+        session.quit()  # never leave an mpv orphan behind
         console.print("[bold]Bye![/bold]")
 
 
