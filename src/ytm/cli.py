@@ -22,6 +22,7 @@ from rich.table import Table
 
 from ytm.player import Player
 from ytm.search import format_duration, search
+from ytm import state
 
 console = Console()
 
@@ -110,7 +111,19 @@ class Session:
     # -- user commands -----------------------------------------------------
 
     def start(self) -> None:
-        """First search, then enter the key loop."""
+        """Restore a saved session if there is one; then loop."""
+        saved = state.load()
+        if saved["entries"]:
+            self.queue = saved["entries"]
+            self.player.set_volume(saved["volume"])
+            console.print(
+                f"[dim]Restored {len(self.queue)} tracks "
+                f"from your last session.[/dim]"
+            )
+            if 0 <= saved["index"] < len(self.queue):
+                self._play_index(saved["index"])  # resume where we left off
+            else:
+                self._next_track()  # queue exists, cursor lost: start at top
         self.do_search()
         self.loop()
 
@@ -133,6 +146,7 @@ class Session:
         console.print(table)
         console.print("[dim]These replace your queue.[/dim]")
         self.queue = results
+        self.index = -1  # old cursor pointed into the old queue
 
         pick = console.input("[bold]Play which #? (Enter to skip) [/bold]")
         if pick.isdigit() and 1 <= int(pick) <= len(self.queue):
@@ -177,8 +191,8 @@ class Session:
         self.player.stop()
 
     def quit(self) -> None:
-        """Shut down playback for real — the missing piece that let mpv
-        keep playing in the background after we exited."""
+        """Persist the session, then shut down playback."""
+        state.save(self.queue, index=self.index, volume=self.player._volume)
         self._stopping = True
         self._generation += 1
         self.player.stop()
