@@ -5,6 +5,7 @@ The interactive loop (pause, volume, next, quit) is the next phase.
 """
 
 import sys
+import time
 
 from rich.console import Console
 
