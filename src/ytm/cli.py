@@ -47,6 +47,7 @@ class Session:
         self._watcher: threading.Thread | None = None
         self._generation = 0  # bumped on every manual action; see _watch
         self._stopping = False  # True when the user quit the session
+        self.loop_queue = True  # widget's repeat button flips this
         self.reporter = self._start_mpris()
 
     # -- desktop (MPRIS) integration ---------------------------------------
@@ -70,6 +71,7 @@ class Session:
             return Reporter(
                 actions=actions,
                 set_volume=self._set_volume_from_desktop,
+                set_loop=self._set_loop_from_desktop,
             )
         except RuntimeError as exc:  # no session bus: run desktop-less
             console.print(f"[dim]Desktop integration unavailable ({exc})[/dim]")
@@ -79,6 +81,9 @@ class Session:
         was = self.player._paused
         self.player.toggle()
         self._mpris_status("Paused" if not was else "Playing")
+
+    def _set_loop_from_desktop(self, on: bool) -> None:
+        self.loop_queue = on  # read by _next_track's wrap logic
 
     def _set_volume_from_desktop(self, volume: int) -> None:
         """Desktop-sent volume: prefer instant IPC, otherwise store only."""
@@ -149,9 +154,11 @@ class Session:
         t.start()
         self._watcher = t
 
-    def _next_track(self, wrap: bool = True) -> None:
+    def _next_track(self, wrap: bool | None = None) -> None:
         if not self.queue:
             return
+        if wrap is None:
+            wrap = self.loop_queue
         nxt = self.index + 1
         if nxt >= len(self.queue):
             if wrap:  # loop back to the top of the queue

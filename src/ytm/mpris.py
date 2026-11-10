@@ -89,15 +89,17 @@ class _Player(ServiceInterface):
     """The playback interface: editable properties for the shell to read,
     methods for it to call. All mutations happen on the loop thread."""
 
-    def __init__(self, actions: dict[str, Callable[[], None]], set_volume):
+    def __init__(self, actions, set_volume, set_loop=lambda _on: None):
         super().__init__("org.mpris.MediaPlayer2.Player")
         self._actions = actions
         self._set_volume = set_volume
+        self._set_loop = set_loop
         self.status = "Stopped"
         self.title = ""
         self.url = ""
         self.track_id = ""  # changes per track so plasma notices new songs
         self.volume = 1.0  # MPRIS uses 0..1; Player keeps 0..100
+        self.loop_status = "Playlist"  # shown value; mutated by widget Set
 
     def _run(self, action: str) -> None:
         fn = self._actions.get(action)
@@ -133,9 +135,34 @@ class _Player(ServiceInterface):
     def PlaybackStatus(self) -> "s":
         return self.status
 
-    @dbus_property(access=PropertyAccess.READ)
+    @dbus_property(access=PropertyAccess.READWRITE)
     def LoopStatus(self) -> "s":
-        return "Playlist"  # v0.2 loops back to the top of the queue
+        # Writable because the media widget's repeat button does a
+        # property Set here; read-only made it silently fail as a
+        # "the property is readonly" bus error.
+        return self.loop_status
+
+    @LoopStatus.setter
+    def LoopStatus(self, status) -> None:
+        # dbus-next hands setters the already-unwrapped python value.
+        status = str(status)
+        self.loop_status = status
+        self.emit_properties_changed({"LoopStatus": status})
+        # "None" = no loop, anything else ("Playlist"/"Track") = loop;
+        # only "None" vs on matters to our simple queue logic.
+        threading.Thread(
+            target=self._set_loop, args=(status != "None",), daemon=True
+        ).start()
+
+    @dbus_property(access=PropertyAccess.READWRITE)
+    def Shuffle(self) -> "b":
+        return False
+
+    @Shuffle.setter
+    def Shuffle(self, wrapped) -> None:
+        # Shuffle isn't implemented yet; accept and remember so widget
+        # toggles don't error, real shuffle is a roadmap item.
+        pass
 
     @dbus_property(access=PropertyAccess.READ)
     def Rate(self) -> "d":
@@ -154,11 +181,9 @@ class _Player(ServiceInterface):
         return self.volume
 
     @Volume.setter
-    def Volume(self, wrapped) -> None:
-        # dbus-next delivers writes inside a Variant("d", x) envelope.
-        # This runs on the loop thread, so the plain-field writes are fine,
-        # and the actual mpv call goes through a side thread.
-        self.volume = max(0.0, min(1.0, float(wrapped["value"])))
+    def Volume(self, value) -> None:
+        # dbus-next hands setters the already-unwrapped python value.
+        self.volume = max(0.0, min(1.0, float(value)))
         self.emit_properties_changed({"Volume": self.volume})
         threading.Thread(
             target=self._set_volume, args=(round(self.volume * 100),), daemon=True
@@ -209,13 +234,14 @@ class _Player(ServiceInterface):
 class Reporter:
     """Owns the D-Bus thread; the Session thread only calls set_state."""
 
-    def __init__(self, actions: dict[str, Callable[[], None]], set_volume):
+    def __init__(self, actions, set_volume, set_loop=lambda _on: None):
         self._actions = actions
         self._set_volume = set_volume
+        self._set_loop = set_loop
         self._ready = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._bus: MessageBus | None = None
-        self._player = _Player(actions, set_volume)
+        self._player = _Player(actions, set_volume, self._set_loop)
         self._thread = threading.Thread(target=self._run_bus, daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout=5):
