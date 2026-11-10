@@ -54,9 +54,13 @@ class Session:
     def _start_mpris(self) -> Reporter | None:
         """Desktop media-keys/now-playing via MPRIS; optional at runtime."""
         actions = {
-            "play": self.player.resume,
-            "pause": self.player.pause,
-            "toggle": lambda: self.player.toggle(),
+            # Widget-initiated changes must re-broadcast status, or the
+            # widget's own icon stays stale and it starts sending the
+            # opposite command (this was the "play button doesn't work"
+            # bug: desktop paused us, cache still said Playing).
+            "play": lambda: (self.player.resume(), self._mpris_status("Playing")),
+            "pause": lambda: (self.player.pause(), self._mpris_status("Paused")),
+            "toggle": self._toggle_from_desktop,
             "next": lambda: (self.stop_current(), self._next_track()),
             "previous": lambda: (self.stop_current(), self._previous_track()),
             "stop": self.stop_current,
@@ -70,6 +74,11 @@ class Session:
         except RuntimeError as exc:  # no session bus: run desktop-less
             console.print(f"[dim]Desktop integration unavailable ({exc})[/dim]")
             return None
+
+    def _toggle_from_desktop(self) -> None:
+        was = self.player._paused
+        self.player.toggle()
+        self._mpris_status("Paused" if not was else "Playing")
 
     def _set_volume_from_desktop(self, volume: int) -> None:
         """Desktop-sent volume: prefer instant IPC, otherwise store only."""
