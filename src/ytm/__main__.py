@@ -1,17 +1,18 @@
 """Entry point for `python -m ytm`.
 
-Phase 3 demo: search, pick a number, hear music from your speakers.
-The interactive loop (pause, volume, next, quit) is the next phase.
+Two ways to run ytm:
+- `python -m ytm "some query"`     — one-shot demo: search, pick, play.
+- `python -m ytm`                  — full interactive session (the real app).
 """
 
 import sys
 import time
 
 from rich.console import Console
-
 from rich.table import Table
 
 from ytm import __version__
+from ytm.cli import Session
 from ytm.player import Player
 from ytm.search import format_duration, search
 
@@ -20,6 +21,7 @@ console = Console()
 
 
 def _demo_search(query: str) -> None:
+    """One-shot mode kept from phase 3: useful for quick tests."""
     results = search(query)
     table = Table(show_header=True, header_style="bold cyan")
     for i, r in enumerate(results, start=1):
@@ -33,7 +35,7 @@ def _demo_search(query: str) -> None:
         player.play(entry)
         console.print(f"[green]Now playing[/green] {entry['title']} — Ctrl+C to skip")
         try:
-            # Block this demo until the song finishes or mpv exits.
+            # Block until the song finishes (or Ctrl+C skips it).
             while player._proc and player._proc.poll() is None:
                 time.sleep(0.5)
         except KeyboardInterrupt:
@@ -46,8 +48,11 @@ def main() -> None:
         _demo_search(" ".join(sys.argv[1:]))
         return
 
-    console.print(f"[bold]ytm[/bold] {__version__}")
-    console.print('Usage: python -m ytm "search terms"')
+    console.print(f"[bold]ytm[/bold] {__version__} — interactive session\n")
+    try:
+        Session().start()
+    finally:
+        console.print("[bold]Bye![/bold]")
 
 
 if __name__ == "__main__":

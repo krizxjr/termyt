@@ -49,6 +49,7 @@ class Player:
         self._proc: subprocess.Popen | None = None
         self._paused = False
         self._current: dict[str, str] | None = None
+        self._volume = 100
 
     @property
     def current(self) -> dict[str, str] | None:
@@ -60,21 +61,36 @@ class Player:
         """True when sound is coming out right now (not paused, not ended)."""
         return self._proc is not None and not self._paused and self._poll() is None
 
-    def play(self, entry: dict[str, str]) -> str:
+    def play(self, entry: dict[str, str], volume: int | None = None) -> str:
         """Start playing `entry`; stop whatever was playing first."""
         self.stop()
+        if volume is not None:
+            self._volume = volume
         stream_url = self._resolve(entry["url"])
         self._proc = subprocess.Popen(
             [
                 "mpv",
                 "--no-video",
                 "--no-terminal",
+                f"--volume={self._volume}",
                 stream_url,
             ]
         )
         self._current = entry
         self._paused = False
         return entry["title"]
+
+    def set_volume(self, volume: int) -> None:
+        """Set volume for the next play; restart the track if playing.
+
+        This simple version restarts the current song from the beginning
+        on a volume change — a fair trade for avoiding an IPC socket in
+        version 1. If that annoys you later, mpv's --input-ipc-server is
+        the upgrade path.
+        """
+        self._volume = volume
+        if self._proc is not None and self._poll() is None and self._current:
+            self.play(self._current)
 
     def pause(self) -> None:
         if self._proc and not self._paused and self._poll() is None:

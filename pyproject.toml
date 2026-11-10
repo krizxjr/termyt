@@ -13,6 +13,7 @@ authors = [{ name = "krizxjr" }]
 dependencies = [
     "yt-dlp>=2024.10.22",
     "rich>=13.7.0",
+    "readchar>=4.1.0",
 ]
 
 [project.optional-dependencies]
