@@ -215,8 +215,26 @@ class Player:
 
     def _ipc_command(self, command: list) -> bool:
         """Send one mpv IPC command; return True if mpv says success."""
-        if self._ipc_path is None:
+        reply = self._ipc_exchange(command)
+        if reply is None:
             return False
+        return reply.get("error") == "success"
+
+    def _ipc_value(self, command: list):
+        """Send one mpv IPC command and return its data (or None).
+
+        Used for reads like ["get_property", "time-pos"], where the reply
+        looks like {"data": 123.45, "error": "success"}.
+        """
+        reply = self._ipc_exchange(command)
+        if reply is None or reply.get("error") != "success":
+            return None
+        return reply.get("data")
+
+    def _ipc_exchange(self, command: list) -> dict | None:
+        """One JSON command over the socket; returns the parsed reply."""
+        if self._ipc_path is None:
+            return None
         message = json.dumps({"command": command}) + "\n"
         try:
             with socket.socket(socket.AF_UNIX) as sock:
@@ -229,16 +247,36 @@ class Player:
                 while b'"error"' not in reply:
                     chunk = sock.recv(4096)
                     if not chunk:  # mpv hung up
-                        return False
+                        return None
                     reply += chunk
         except OSError:
-            return False
+            return None
         try:
             first_line = reply.splitlines()[0].decode("utf-8", "replace")
-            response = json.loads(first_line)
-            return response.get("error") == "success"
+            return json.loads(first_line)
         except (IndexError, ValueError, KeyError):
+            return None
+
+    def get_time_pos(self) -> float | None:
+        """Current playback position in seconds (None if unknown)."""
+        data = self._ipc_value(["get_property", "time-pos"])
+        try:
+            return float(data)
+        except (TypeError, ValueError):
+            return None
+
+    def seek_to(self, seconds: float) -> bool:
+        """Absolute seek (MPRIS SetPosition), same pause dance as seek()."""
+        if not (self._proc is not None and self._poll() is None):
             return False
+        if not (self._ipc_path and self._ipc_alive()):
+            return False
+        if self._paused:
+            self.resume()
+            ok = self._ipc_command(["seek", seconds, "absolute"])
+            self.pause()
+            return ok
+        return self._ipc_command(["seek", seconds, "absolute"])
 
     @staticmethod
     def _resolve(webpage_url: str) -> str:

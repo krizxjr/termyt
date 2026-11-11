@@ -28,7 +28,7 @@ from typing import Callable
 
 from dbus_next import Variant
 from dbus_next.aio import MessageBus
-from dbus_next.service import PropertyAccess, ServiceInterface, dbus_property, method
+from dbus_next.service import PropertyAccess, ServiceInterface, dbus_property, method, signal
 
 BUS_NAME = "org.mpris.MediaPlayer2.termyt"
 PATH = "/org/mpris/MediaPlayer2"
@@ -90,12 +90,16 @@ class _Player(ServiceInterface):
     methods for it to call. All mutations happen on the loop thread."""
 
     def __init__(self, actions, set_volume, set_loop=lambda _on: None,
-                 set_shuffle=lambda _on: None):
+                 set_shuffle=lambda _on: None, get_position=lambda: None,
+                 seek_rel=lambda _secs: False, seek_to=lambda _secs: False):
         super().__init__("org.mpris.MediaPlayer2.Player")
         self._actions = actions
         self._set_volume = set_volume
         self._set_loop = set_loop
         self._set_shuffle = set_shuffle
+        self._get_position = get_position
+        self._seek_rel = seek_rel
+        self._seek_to = seek_to
         self.status = "Stopped"
         self.title = ""
         self.url = ""
@@ -209,7 +213,7 @@ class _Player(ServiceInterface):
 
     @dbus_property(access=PropertyAccess.READ)
     def CanSeek(self) -> "b":
-        return False
+        return True
 
     @dbus_property(access=PropertyAccess.READ)
     def CanGoPrevious(self) -> "b":
@@ -221,9 +225,27 @@ class _Player(ServiceInterface):
 
     @dbus_property(access=PropertyAccess.READ)
     def Position(self) -> "x":
-        # Optional per spec but KMedia polls it; 0 vs not-declared is
-        # the difference between "no progress bar info" and log spam.
-        return 0
+        # Live read through the mpv IPC socket; microseconds per MPRIS.
+        pos = self._get_position()
+        return int(pos * 1_000_000) if pos is not None else 0
+
+    @signal("Seeked")
+    def Seeked(self, position: "x") -> None:
+        """Emitted after a seek lands; the widget resnaps its bar."""
+
+    @method()
+    def Seek(self, offset: "x") -> None:
+        seconds = offset / 1_000_000
+        threading.Thread(
+            target=self._seek_rel, args=(seconds,), daemon=True
+        ).start()
+
+    @method()
+    def SetPosition(self, track_id: "o", position: "x") -> None:
+        seconds = position / 1_000_000
+        threading.Thread(
+            target=self._seek_to, args=(seconds,), daemon=True
+        ).start()
 
     @dbus_property(access=PropertyAccess.READ)
     def Metadata(self) -> "a{sv}":
@@ -241,16 +263,21 @@ class Reporter:
     """Owns the D-Bus thread; the Session thread only calls set_state."""
 
     def __init__(self, actions, set_volume, set_loop=lambda _on: None,
-                 set_shuffle=lambda _on: None):
+                 set_shuffle=lambda _on: None, get_position=lambda: None,
+                 seek_rel=lambda _secs: False, seek_to=lambda _secs: False):
         self._actions = actions
         self._set_volume = set_volume
         self._set_loop = set_loop
         self._set_shuffle = set_shuffle
+        self._get_position = get_position
+        self._seek_rel = seek_rel
+        self._seek_to = seek_to
         self._ready = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._bus: MessageBus | None = None
         self._player = _Player(actions, set_volume, self._set_loop,
-                               self._set_shuffle)
+                               self._set_shuffle, self._get_position,
+                               self._seek_rel, self._seek_to)
         self._thread = threading.Thread(target=self._run_bus, daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout=5):
@@ -278,10 +305,40 @@ class Reporter:
         # coroutine would let asyncio.run() close the loop — and the bus
         # socket with it (that was the smoke-test bug: name registered,
         # then instantly "recipient disconnected").
+        asyncio.create_task(self._position_poller())
         await bus.wait_for_disconnect()
 
     def _quit_session(self) -> None:
         self._actions.get("quit", lambda: None)()
+
+    async def _position_poller(self) -> None:
+        """Emit Position periodically so widget bars move without polling.
+
+        Reads happen off the loop thread (asyncio.to_thread) because the
+        IPC socket call can block for up to the socket timeout.
+        """
+        while True:
+            await asyncio.sleep(2.0)
+            if self._player.status != "Playing":
+                continue
+            pos = await asyncio.to_thread(self._get_position)
+            if pos is not None:
+                self._player.emit_properties_changed(
+                    {"Position": int(pos * 1_000_000)}
+                )
+
+    def note_seeked(self) -> None:
+        """Tell widgets the bar moved (seek from the terminal side)."""
+        if not (self._alive and self._loop):
+            return
+        pos = self._get_position()
+        try:
+            self._loop.call_soon_threadsafe(
+                self._player.Seeked,
+                int((pos or 0) * 1_000_000),
+            )
+        except RuntimeError:
+            pass
 
     def set_state(
         self,

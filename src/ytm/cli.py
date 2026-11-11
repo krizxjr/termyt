@@ -105,6 +105,9 @@ class Session:
                 set_volume=self._set_volume_from_desktop,
                 set_loop=self._set_loop_from_desktop,
                 set_shuffle=self._set_shuffle_from_desktop,
+                get_position=self.player.get_time_pos,
+                seek_rel=self.player.seek,
+                seek_to=self.player.seek_to,
             )
         except RuntimeError as exc:  # no session bus: run desktop-less
             console.print(f"[dim]Desktop integration unavailable ({exc})[/dim]")
@@ -293,11 +296,15 @@ class Session:
                 # 10s forward; '<' below seeks back the same amount
                 if self.player.seek(10):
                     console.print("[dim]→ +10s[/dim]")
+                    if self.reporter:
+                        self.reporter.note_seeked()
                 else:
                     console.print("[dim]seek unavailable[/dim]")
             elif key == "<":
                 if self.player.seek(-10):
                     console.print("[dim]← −10s[/dim]")
+                    if self.reporter:
+                        self.reporter.note_seeked()
                 else:
                     console.print("[dim]seek unavailable[/dim]")
             elif key in ("=", "+"):
