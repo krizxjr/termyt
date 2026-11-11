@@ -167,6 +167,11 @@ class Session:
             return  # quit raced an auto-advance; do not resurrect playback
         self.index = i
         self._generation += 1
+        # Clear the widget BEFORE the (multi-second) resolve, so it shows
+        # "no track" instead of the old song's seek bar at 0 — a bar you
+        # could drag while nothing is actually playing.
+        if self.reporter:
+            self.reporter.set_state(status="Stopped", has_track=False)
         title = self.player.play(self.queue[i])
         if title is None:
             # Superseded by a newer play while resolving (rapid keys or a
