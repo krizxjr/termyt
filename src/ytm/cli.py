@@ -176,6 +176,9 @@ class Session:
                 status=status,
                 title=self.player.current["title"] if self.player.current else None,
                 url=self.player.current["url"] if self.player.current else None,
+                duration=self.player.current["duration"]
+                if self.player.current
+                else None,
                 volume=self.player._volume,
                 has_track=bool(self.player.current),
             )

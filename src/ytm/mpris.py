@@ -103,6 +103,7 @@ class _Player(ServiceInterface):
         self.status = "Stopped"
         self.title = ""
         self.url = ""
+        self.duration = 0.0  # seconds; drives mpris:length (bar scale)
         self.track_id = ""  # changes per track so plasma notices new songs
         self.volume = 1.0  # MPRIS uses 0..1; Player keeps 0..100
         self.loop_status = "Playlist"  # shown value; mutated by widget Set
@@ -249,7 +250,7 @@ class _Player(ServiceInterface):
 
     @dbus_property(access=PropertyAccess.READ)
     def Metadata(self) -> "a{sv}":
-        return {
+        metadata = {
             "mpris:trackid": Variant(
                 "o", "/org/mpris/MediaPlayer2/track" + self.track_id
             )
@@ -257,6 +258,11 @@ class _Player(ServiceInterface):
             "xesam:title": Variant("s", self.title or "termyt"),
             "xesam:url": Variant("s", self.url or ""),
         }
+        if self.duration and self.duration > 0:
+            metadata["mpris:length"] = Variant(
+                "x", int(self.duration * 1_000_000)
+            )
+        return metadata
 
 
 class Reporter:
@@ -346,6 +352,7 @@ class Reporter:
         status: str | None = None,
         title: str | None = None,
         url: str | None = None,
+        duration: float | None = None,
         volume: int | None = None,
         has_track: bool | None = None,
         shuffle: bool | None = None,
@@ -357,6 +364,7 @@ class Reporter:
             "status": status,
             "title": title,
             "url": url,
+            "duration": duration,
             "volume": None if volume is None else max(0.0, min(1.0, volume / 100)),
             "has_track": has_track,
             "shuffle": shuffle,
@@ -374,6 +382,8 @@ class Reporter:
             p.track_id = _object_path_escape(payload["url"] or "/none")
         if payload["url"]:
             p.url = payload["url"]
+        if payload["duration"] is not None:
+            p.duration = payload["duration"]
         if payload["volume"] is not None:
             p.volume = payload["volume"]
             changed["Volume"] = p.volume
@@ -384,13 +394,17 @@ class Reporter:
             p.status = payload["status"]
             changed["PlaybackStatus"] = p.status
         if payload["has_track"] and payload["title"] is not None:
-            changed["Metadata"] = {
+            metadata = {
                 "mpris:trackid": Variant(
                     "o", "/org/mpris/MediaPlayer2/track" + (p.track_id or "/none")
                 ),
                 "xesam:title": Variant("s", p.title or "termyt"),
                 "xesam:url": Variant("s", p.url or ""),
             }
+            if p.duration and p.duration > 0:
+                # Widgets won't draw a seek bar without a track length.
+                metadata["mpris:length"] = Variant("x", int(p.duration * 1_000_000))
+            changed["Metadata"] = metadata
         if changed:
             # Official emissions API for read-only properties: mutates only
             # plain fields above, then signals clients in one message.
