@@ -32,7 +32,7 @@ console = Console()
 _MENU = (
     "\n[bold cyan]Controls[/bold cyan]  "
     "p=pause/resume  n=next  b=previous  s=search  "
-    "+=/- volume  q=quit\n"
+    "<=seek −10s  >=seek +10s  +=/- volume  q=quit\n"
 )
 
 
@@ -241,6 +241,17 @@ class Session:
             elif key == "s":
                 self.stop_current()
                 self.do_search()
+            elif key == ">":
+                # 10s forward; '<' below seeks back the same amount
+                if self.player.seek(10):
+                    console.print("[dim]→ +10s[/dim]")
+                else:
+                    console.print("[dim]seek unavailable[/dim]")
+            elif key == "<":
+                if self.player.seek(-10):
+                    console.print("[dim]← −10s[/dim]")
+                else:
+                    console.print("[dim]seek unavailable[/dim]")
             elif key in ("=", "+"):
                 self._generation += 1  # old watcher is stale either way:
                 # IPC path keeps the same proc (watcher must be replaced

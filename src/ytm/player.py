@@ -117,6 +117,28 @@ class Player:
                 return  # done: instant, no restart
             self.play(self._current)  # fallback: restart with new --volume
 
+    def seek(self, delta: float) -> bool:
+        """Jump delta seconds from the current position (negative = back).
+
+        Returns True if the seek happened. False means "nothing to seek":
+        no process, it already ended, or the IPC socket isn't alive.
+
+        The pause subtlety is the same one as SIGTERM-vs-SIGSTOP: a
+        SIGSTOPped process can't answer IPC either. So if we're paused we
+        briefly resume, seek, and re-pause — the user just hears the new
+        position stay silent, exactly like seeking in any player.
+        """
+        if not (self._proc is not None and self._poll() is None):
+            return False
+        if not (self._ipc_path and self._ipc_alive()):
+            return False
+        if self._paused:
+            self.resume()
+            ok = self._ipc_command(["seek", delta, "relative"])
+            self.pause()
+            return ok
+        return self._ipc_command(["seek", delta, "relative"])
+
     def pause(self) -> None:
         if self._proc and not self._paused and self._poll() is None:
             self._proc.send_signal(signal.SIGSTOP)
