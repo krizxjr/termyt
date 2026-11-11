@@ -8,13 +8,33 @@ change inside this file, never the rest of the app.
 
 from __future__ import annotations
 
+import re
+
 from yt_dlp import YoutubeDL
+
+
+def _clean(exc: BaseException) -> str:
+    """Strip ANSI escape codes from an exception message (yt-dlp
+    colorizes its errors before we ever see them)."""
+    return re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
+
+
+class _SilentLogger:
+    """yt-dlp's logger hook: its default logger prints straight to
+    stderr even with quiet=True — we surface errors as RuntimeError."""
+
+    def debug(self, msg) -> None: ...
+    def info(self, msg) -> None: ...
+    def warning(self, msg) -> None: ...
+    def error(self, msg) -> None: ...
+
 
 # We only need metadata, so we tell yt-dlp to fetch as little as possible.
 # "skip_download" never saves any audio to disk.
 _SEARCH_OPTIONS = {
     "quiet": True,          # no progress bars or debug output
     "no_warnings": True,    # hide yt-dlp's warning chatter
+    "logger": _SilentLogger(),
     "skip_download": True,  # extract info only, never download media
     "extract_flat": True,   # don't resolve each video fully: much faster
 }
@@ -38,7 +58,7 @@ def search(query: str, limit: int = 5) -> list[dict[str, str]]:
         with YoutubeDL(_SEARCH_OPTIONS) as ydl:
             data = ydl.extract_info(url, download=False)
     except Exception as exc:  # yt-dlp raises many unrelated exception types
-        raise RuntimeError(f"Search failed: {exc}") from exc
+        raise RuntimeError(f"Search failed: {_clean(exc)}") from exc
 
     if data is None:
         raise RuntimeError(f"Search failed: no results for {query!r}")

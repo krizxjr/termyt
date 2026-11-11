@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -41,9 +42,27 @@ from yt_dlp import YoutubeDL
 
 # We only need metadata, so we tell yt-dlp to fetch as little as possible.
 # "skip_download" never saves any audio to disk.
+def _clean(exc: BaseException) -> str:
+    """Strip ANSI escape codes from an exception message (yt-dlp colorizes
+    its errors before we ever see them)."""
+    return re.sub(r"\x1b\[[0-9;]*m", "", str(exc))
+
+
+class _SilentLogger:
+    """yt-dlp's logger hook: its default logger prints straight to stderr
+    ("ERROR: [youtube] …") even with quiet=True — we surface errors
+    ourselves as RuntimeError, so yt-dlp must stay silent."""
+
+    def debug(self, msg) -> None: ...
+    def info(self, msg) -> None: ...
+    def warning(self, msg) -> None: ...
+    def error(self, msg) -> None: ...
+
+
 _EXTRACT_OPTIONS = {
     "quiet": True,
     "no_warnings": True,
+    "logger": _SilentLogger(),
     "skip_download": True,
     "format": "bestaudio",
 }
@@ -346,7 +365,7 @@ class Player:
             # Unavailable, region-locked, removed… convert yt-dlp's many
             # exception types into the one callers already know, keeping
             # yt-dlp details inside this class (same policy as search).
-            raise RuntimeError(f"couldn't load stream: {exc}") from exc
+            raise RuntimeError(f"couldn't load stream: {_clean(exc)}") from exc
         if not info or not info.get("url"):
             raise RuntimeError(f"Could not resolve a stream for {webpage_url}")
         return info["url"]
