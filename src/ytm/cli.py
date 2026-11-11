@@ -15,7 +15,10 @@ process, and they meet only when one of them changes playback state.
 from __future__ import annotations
 
 import random
+import shutil
+import sys
 import threading
+import time
 
 import readchar
 from rich.console import Console
@@ -81,6 +84,14 @@ class Session:
         self.shuffle = False  # widget's shuffle button and `z` flip this
         self._rng = random.Random()  # swappable in tests
         self.reporter = self._start_mpris()
+        # Terminal progress bar: a daemon thread redraws one line in place
+        # while a track plays; any keypress message first breaks off that
+        # line (see _announce) so the two never fight over it.
+        self._bar_active = False  # a bar line is currently on screen
+        self._bar_hold = False  # True while a prompt owns the terminal
+        self._progress_thread = threading.Thread(
+            target=self._progress_loop, daemon=True
+        )
 
     # -- desktop (MPRIS) integration ---------------------------------------
 
@@ -123,7 +134,7 @@ class Session:
 
     def _set_shuffle_from_desktop(self, on: bool) -> None:
         self.shuffle = on
-        console.print(f"[dim]shuffle → {'on' if on else 'off'}[/dim]")
+        self._announce(f"[dim]shuffle → {'on' if on else 'off'}[/dim]")
 
     def _toggle_shuffle(self) -> None:
         self.shuffle = not self.shuffle
@@ -141,10 +152,70 @@ class Session:
             self.player._volume = clamped  # live for the next play
 
     def _quit_from_desktop(self) -> None:
-        console.print("[dim]Quit requested from the desktop.[/dim]")
+        self._announce("[dim]Quit requested from the desktop.[/dim]")
         self._stopping = True
         self.player.stop()
         # The key loop notices the flag on its next keypress; Ctrl+C also works.
+
+    # -- terminal progress bar ---------------------------------------------
+
+    def _clear_bar(self) -> None:
+        """Erase the in-place progress line, if one is on screen."""
+        if self._bar_active:
+            sys.stdout.write("\r\x1b[K")  # CR + clear-to-end-of-line
+            sys.stdout.flush()
+            self._bar_active = False
+
+    def _announce(self, text: str) -> None:
+        """Print a message; clear the progress line first so it doesn't
+        end up smeared across the message, and so the next tick redraws
+        the bar on a fresh line below it."""
+        self._clear_bar()
+        console.print(text)
+
+    def _ask(self, prompt: str) -> str:
+        """console.input while the ticker stands down (it must not redraw
+        its line over the user's typing)."""
+        self._bar_hold = True
+        self._clear_bar()
+        try:
+            return console.input(prompt)
+        finally:
+            self._bar_hold = False
+
+    def _progress_loop(self) -> None:
+        """Redraw one overwrite-in-place line every second while playing.
+
+        Hidden when paused (player.playing is False) and while a prompt
+        is on screen (_bar_hold). Writing goes straight to stdout with a
+        carriage return, so it works alongside readchar's raw-mode loop.
+        """
+        width = min(30, max(10, shutil.get_terminal_size().columns - 40))
+        while not self._stopping:
+            if (
+                not self._bar_hold
+                and self.player.playing
+                and 0 <= self.index < len(self.queue)
+            ):
+                pos = self.player.get_time_pos()
+                if pos is not None:
+                    dur = float(self.queue[self.index].get("duration") or 0)
+                    frac = max(0.0, min(1.0, pos / dur)) if dur > 0 else 0.0
+                    filled = round(frac * width)
+                    line = (
+                        f"{format_duration(int(pos))} |"
+                        + "█" * filled
+                        + "─" * (width - filled)
+                        + f"| {format_duration(int(dur))}"
+                    )
+                    sys.stdout.write("\r" + line + "\x1b[K")
+                    sys.stdout.flush()
+                    self._bar_active = True
+                else:
+                    self._clear_bar()
+            else:
+                self._clear_bar()
+            time.sleep(1)
 
     # -- playback plumbing -------------------------------------------------
 
@@ -159,7 +230,7 @@ class Session:
         if proc is not None:
             proc.wait()
         if generation == self._generation and not self._stopping:
-            console.print("[dim](track finished)[/dim]")
+            self._announce("[dim](track finished)[/dim]")
             on_end()
 
     def _play_index(self, i: int) -> None:
@@ -178,7 +249,7 @@ class Session:
             # widget action). The newer play owns state; do not print,
             # broadcast, or start a watcher for a proc we never spawned.
             return
-        console.print(f"[green]▶[/green] {i + 1}/{len(self.queue)} {title}")
+        self._announce(f"[green]▶[/green] {i + 1}/{len(self.queue)} {title}")
         self._mpris_status("Playing")
         self._start_watcher()
 
@@ -226,7 +297,7 @@ class Session:
             rng=self._rng,
         )
         if nxt == -1:
-            console.print("[dim]End of queue.[/dim]")
+            self._announce("[dim]End of queue.[/dim]")
             return
         self._play_index(nxt)
 
@@ -242,6 +313,7 @@ class Session:
 
     def start(self) -> None:
         """Restore a saved session if there is one; then loop."""
+        self._progress_thread.start()
         saved = state.load()
         if saved["entries"]:
             self.queue = saved["entries"]
@@ -258,7 +330,7 @@ class Session:
         self.loop()
 
     def do_search(self) -> None:
-        query = console.input("[bold]Search: [/bold]")
+        query = self._ask("[bold]Search: [/bold]")
         if not query.strip():
             return
         with console.status("[bold]Searching…"):
@@ -274,12 +346,29 @@ class Session:
         for i, r in enumerate(results, start=1):
             table.add_row(str(i), r["title"], format_duration(r["duration"]))
         console.print(table)
-        console.print("[dim]These replace your queue.[/dim]")
-        self.queue = results
-        self.index = -1  # old cursor pointed into the old queue
 
-        pick = console.input("[bold]Play which #? (Enter to skip) [/bold]")
-        if pick.isdigit() and 1 <= int(pick) <= len(self.queue):
+        # Three-way pick: number replaces the queue and plays it; aN appends
+        # that one result to the end of the existing queue (playback keeps
+        # going untouched); Enter skips. The queue swap happens ONLY in the
+        # play branch, because append must extend the *current* queue.
+        pick = self._ask(
+            "[bold]Play which #? (aN = append to queue, Enter to skip) [/bold]"
+        )
+        pick = pick.strip().lower()
+        if pick.startswith("a") and pick[1:].isdigit():
+            n = int(pick[1:])
+            if 1 <= n <= len(results):
+                self.queue.append(results[n - 1])
+                console.print(
+                    f"[dim]appended \"{results[n - 1]['title']}\" — "
+                    f"queue now has {len(self.queue)} tracks[/dim]"
+                )
+            else:
+                console.print("[red]No such result number.[/red]")
+            return
+        if pick.isdigit() and 1 <= int(pick) <= len(results):
+            self.queue = results
+            self.index = -1  # old cursor pointed into the old queue
             self._play_index(int(pick) - 1)
 
     def loop(self) -> None:
@@ -292,7 +381,9 @@ class Session:
                 was = self.player._paused
                 self._generation += 1
                 self.player.toggle()
-                console.print("[dim]paused[/dim]" if not was else "[dim]resumed[/dim]")
+                self._announce(
+                    "[dim]paused[/dim]" if not was else "[dim]resumed[/dim]"
+                )
                 self._mpris_status("Paused" if not was else "Playing")
             elif key == "n":
                 self.stop_current()
@@ -310,18 +401,18 @@ class Session:
             elif key == ">":
                 # 10s forward; '<' below seeks back the same amount
                 if self.player.seek(10):
-                    console.print("[dim]→ +10s[/dim]")
+                    self._announce("[dim]→ +10s[/dim]")
                     if self.reporter:
                         self.reporter.note_seeked()
                 else:
-                    console.print("[dim]seek unavailable[/dim]")
+                    self._announce("[dim]seek unavailable[/dim]")
             elif key == "<":
                 if self.player.seek(-10):
-                    console.print("[dim]← −10s[/dim]")
+                    self._announce("[dim]← −10s[/dim]")
                     if self.reporter:
                         self.reporter.note_seeked()
                 else:
-                    console.print("[dim]seek unavailable[/dim]")
+                    self._announce("[dim]seek unavailable[/dim]")
             elif key in ("=", "+"):
                 self._generation += 1  # old watcher is stale either way:
                 # IPC path keeps the same proc (watcher must be replaced
@@ -331,14 +422,14 @@ class Session:
                 self._start_watcher()
                 if self.reporter:
                     self.reporter.set_state(volume=self.player._volume)
-                console.print(f"[dim]volume → {self.player._volume}[/dim]")
+                self._announce(f"[dim]volume → {self.player._volume}[/dim]")
             elif key == "-":
                 self._generation += 1
                 self.player.set_volume(self.player._volume - 10)
                 self._start_watcher()
                 if self.reporter:
                     self.reporter.set_state(volume=self.player._volume)
-                console.print(f"[dim]volume → {self.player._volume}[/dim]")
+                self._announce(f"[dim]volume → {self.player._volume}[/dim]")
 
     def stop_current(self) -> None:
         """Manual navigation: bump the generation so the old watcher quits."""
@@ -354,7 +445,7 @@ class Session:
         lock is contended), we come back with SIGKILL — the one outcome
         that must never fail is "quitting leaves silence".
         """
-        self._stopping = True
+        self._stopping = True  # also ends the progress ticker thread
         state.save(self.queue, index=self.index, volume=self.player._volume)
         if self.reporter:
             self.reporter.stop()
@@ -363,3 +454,4 @@ class Session:
             self.player.stop()
         except KeyboardInterrupt:
             self.player.force_kill()
+        self._clear_bar()
