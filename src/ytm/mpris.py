@@ -370,7 +370,12 @@ class Reporter:
             "shuffle": shuffle,
         }
         if self._loop:
-            self._loop.call_soon_threadsafe(self._apply, payload)
+            try:
+                self._loop.call_soon_threadsafe(self._apply, payload)
+            except RuntimeError:
+                # Loop already closed (quit raced a widget action); the
+                # desktop side simply doesn't get this update.
+                self._alive = False
 
     def _apply(self, payload: dict) -> None:
         if not self._bus:

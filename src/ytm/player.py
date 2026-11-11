@@ -32,6 +32,7 @@ import os
 import signal
 import socket
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -64,6 +65,13 @@ class Player:
         self._current: dict[str, str] | None = None
         self._volume = 100
         self._ipc_path: Path | None = None
+        # Multiple threads mutate this object (key loop, auto-advance
+        # watcher, desktop widget actions). Every state transition holds
+        # this lock, so "stop old proc, spawn new proc" can never be
+        # interleaved into "stop, stop, spawn, spawn" — the exact race
+        # that leaked a second playing mpv. RLock because transitions
+        # legitimately nest (play calls stop; seek calls pause/resume).
+        self._lock = threading.RLock()
 
     @property
     def current(self) -> dict[str, str] | None:
@@ -77,29 +85,30 @@ class Player:
 
     def play(self, entry: dict[str, str], volume: int | None = None) -> str:
         """Start playing `entry`; stop whatever was playing first."""
-        self.stop()
-        if volume is not None:
-            self._volume = volume
-        stream_url = self._resolve(entry["url"])
-        args = [
-            "mpv",
-            "--no-video",
-            "--no-terminal",
-            f"--volume={self._volume}",
-            stream_url,
-        ]
-        if self._ipc_setup():
-            args.insert(1, f"--input-ipc-server={self._ipc_path}")
-        try:
-            self._proc = subprocess.Popen(args, stderr=subprocess.DEVNULL)
-        except OSError:  # socket path failed?  fall back to signal-only mode
-            self._ipc_path = None
-            args = ["mpv", "--no-video", "--no-terminal",
-                    f"--volume={self._volume}", stream_url]
-            self._proc = subprocess.Popen(args, stderr=subprocess.DEVNULL)
-        self._current = entry
-        self._paused = False
-        return entry["title"]
+        with self._lock:
+            self.stop()
+            if volume is not None:
+                self._volume = volume
+            stream_url = self._resolve(entry["url"])
+            args = [
+                "mpv",
+                "--no-video",
+                "--no-terminal",
+                f"--volume={self._volume}",
+                stream_url,
+            ]
+            if self._ipc_setup():
+                args.insert(1, f"--input-ipc-server={self._ipc_path}")
+            try:
+                self._proc = subprocess.Popen(args, stderr=subprocess.DEVNULL)
+            except OSError:  # socket path failed?  fall back to signal-only mode
+                self._ipc_path = None
+                args = ["mpv", "--no-video", "--no-terminal",
+                        f"--volume={self._volume}", stream_url]
+                self._proc = subprocess.Popen(args, stderr=subprocess.DEVNULL)
+            self._current = entry
+            self._paused = False
+            return entry["title"]
 
     def set_volume(self, volume: int) -> None:
         """Set volume, remembering it for the next play.
@@ -108,14 +117,15 @@ class Player:
         keeps going at the new loudness. Only when the IPC socket isn't
         available do we restart the track as a fallback.
         """
-        volume = max(0, min(100, volume))  # clamp before anything else
-        self._volume = volume
-        if self._proc is not None and self._poll() is None and self._current:
-            if self._ipc_path and self._ipc_alive() and self._ipc_command(
-                ["set_property", "volume", volume]
-            ):
-                return  # done: instant, no restart
-            self.play(self._current)  # fallback: restart with new --volume
+        with self._lock:
+            volume = max(0, min(100, volume))  # clamp before anything else
+            self._volume = volume
+            if self._proc is not None and self._poll() is None and self._current:
+                if self._ipc_path and self._ipc_alive() and self._ipc_command(
+                    ["set_property", "volume", volume]
+                ):
+                    return  # done: instant, no restart
+                self.play(self._current)  # fallback: restart with new --volume
 
     def seek(self, delta: float) -> bool:
         """Jump delta seconds from the current position (negative = back).
@@ -128,57 +138,62 @@ class Player:
         briefly resume, seek, and re-pause — the user just hears the new
         position stay silent, exactly like seeking in any player.
         """
-        if not (self._proc is not None and self._poll() is None):
-            return False
-        if not (self._ipc_path and self._ipc_alive()):
-            return False
-        if self._paused:
-            self.resume()
-            ok = self._ipc_command(["seek", delta, "relative"])
-            self.pause()
-            return ok
-        return self._ipc_command(["seek", delta, "relative"])
+        with self._lock:
+            if not (self._proc is not None and self._poll() is None):
+                return False
+            if not (self._ipc_path and self._ipc_alive()):
+                return False
+            if self._paused:
+                self.resume()
+                ok = self._ipc_command(["seek", delta, "relative"])
+                self.pause()
+                return ok
+            return self._ipc_command(["seek", delta, "relative"])
 
     def pause(self) -> None:
-        if self._proc and not self._paused and self._poll() is None:
-            self._proc.send_signal(signal.SIGSTOP)
-            self._paused = True
+        with self._lock:
+            if self._proc and not self._paused and self._poll() is None:
+                self._proc.send_signal(signal.SIGSTOP)
+                self._paused = True
 
     def resume(self) -> None:
-        if self._proc and self._paused:
-            self._proc.send_signal(signal.SIGCONT)
-            self._paused = False
+        with self._lock:
+            if self._proc and self._paused:
+                self._proc.send_signal(signal.SIGCONT)
+                self._paused = False
 
     def toggle(self) -> None:
         """Pause if playing, resume if paused."""
-        if self._paused:
-            self.resume()
-        else:
-            self.pause()
+        with self._lock:
+            if self._paused:
+                self.resume()
+            else:
+                self.pause()
 
     def stop(self) -> None:
         """End playback and reap the child process."""
-        if self._proc is None:
+        with self._lock:
+            if self._proc is None:
+                self._current = None
+                return
+            if self._poll() is None:  # still running: kill it
+                if self._paused:  # a stopped process can't receive SIGTERM
+                    self.resume()
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:  # stubborn child
+                    self._proc.kill()
+                    self._proc.wait()
+            self._proc = None
             self._current = None
-            return
-        if self._poll() is None:  # still running: kill it
-            if self._paused:  # a stopped process can't receive SIGTERM
-                self.resume()
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:  # stubborn child
-                self._proc.kill()
-                self._proc.wait()
-        self._proc = None
-        self._current = None
-        self._paused = False
-        if self._ipc_path and self._ipc_path.exists():  # socket file cleanup
-            try:
-                self._ipc_path.unlink()
-            except OSError:
-                pass  # a leftover file in /tmp is harmless
-        self._ipc_path = None
+            self._paused = False
+            if self._ipc_path and self._ipc_path.exists():  # socket cleanup
+                try:
+                    self._ipc_path.unlink()
+                except OSError:
+                    pass  # a leftover file in /tmp is harmless
+            self._ipc_path = None
 
     def _poll(self) -> int | None:
         """Child's exit code, or None if still running."""
@@ -267,16 +282,17 @@ class Player:
 
     def seek_to(self, seconds: float) -> bool:
         """Absolute seek (MPRIS SetPosition), same pause dance as seek()."""
-        if not (self._proc is not None and self._poll() is None):
-            return False
-        if not (self._ipc_path and self._ipc_alive()):
-            return False
-        if self._paused:
-            self.resume()
-            ok = self._ipc_command(["seek", seconds, "absolute"])
-            self.pause()
-            return ok
-        return self._ipc_command(["seek", seconds, "absolute"])
+        with self._lock:
+            if not (self._proc is not None and self._poll() is None):
+                return False
+            if not (self._ipc_path and self._ipc_alive()):
+                return False
+            if self._paused:
+                self.resume()
+                ok = self._ipc_command(["seek", seconds, "absolute"])
+                self.pause()
+                return ok
+            return self._ipc_command(["seek", seconds, "absolute"])
 
     @staticmethod
     def _resolve(webpage_url: str) -> str:
