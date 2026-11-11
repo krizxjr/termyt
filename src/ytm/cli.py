@@ -173,16 +173,6 @@ class Session:
         self._clear_bar()
         console.print(text)
 
-    def _ask(self, prompt: str) -> str:
-        """console.input while the ticker stands down (it must not redraw
-        its line over the user's typing)."""
-        self._bar_hold = True
-        self._clear_bar()
-        try:
-            return console.input(prompt)
-        finally:
-            self._bar_hold = False
-
     def _progress_loop(self) -> None:
         """Redraw one overwrite-in-place line every second while playing.
 
@@ -330,46 +320,57 @@ class Session:
         self.loop()
 
     def do_search(self) -> None:
-        query = self._ask("[bold]Search: [/bold]")
-        if not query.strip():
-            return
-        with console.status("[bold]Searching…"):
-            try:
-                results = search(query)
-            except RuntimeError as exc:
-                console.print(f"[red]{exc}[/red]")
+        # Hold the ticker for the ENTIRE search flow, not just the two
+        # prompts: the network search takes seconds, and during that
+        # window the ticker used to redraw its line over the spinner,
+        # the results table, and rich's escape sequences (the garbage
+        # the user saw after "Search:").
+        was_holding = self._bar_hold
+        self._bar_hold = True
+        try:
+            query = console.input("[bold]Search: [/bold]")
+            if not query.strip():
                 return
-        if not results:
-            console.print("[yellow]No results.[/yellow]")
-            return
-        table = Table(show_header=True, header_style="bold cyan")
-        for i, r in enumerate(results, start=1):
-            table.add_row(str(i), r["title"], format_duration(r["duration"]))
-        console.print(table)
+            with console.status("[bold]Searching…"):
+                try:
+                    results = search(query)
+                except RuntimeError as exc:
+                    console.print(f"[red]{exc}[/red]")
+                    return
+            if not results:
+                console.print("[yellow]No results.[/yellow]")
+                return
+            table = Table(show_header=True, header_style="bold cyan")
+            for i, r in enumerate(results, start=1):
+                table.add_row(str(i), r["title"], format_duration(r["duration"]))
+            console.print(table)
 
-        # Three-way pick: number replaces the queue and plays it; aN appends
-        # that one result to the end of the existing queue (playback keeps
-        # going untouched); Enter skips. The queue swap happens ONLY in the
-        # play branch, because append must extend the *current* queue.
-        pick = self._ask(
-            "[bold]Play which #? (aN = append to queue, Enter to skip) [/bold]"
-        )
-        pick = pick.strip().lower()
-        if pick.startswith("a") and pick[1:].isdigit():
-            n = int(pick[1:])
-            if 1 <= n <= len(results):
-                self.queue.append(results[n - 1])
-                console.print(
-                    f"[dim]appended \"{results[n - 1]['title']}\" — "
-                    f"queue now has {len(self.queue)} tracks[/dim]"
-                )
-            else:
-                console.print("[red]No such result number.[/red]")
-            return
-        if pick.isdigit() and 1 <= int(pick) <= len(results):
-            self.queue = results
-            self.index = -1  # old cursor pointed into the old queue
-            self._play_index(int(pick) - 1)
+            # Three-way pick: number replaces the queue and plays it; aN
+            # appends that one result to the end of the existing queue
+            # (playback keeps going untouched); Enter skips. The queue
+            # swap happens ONLY in the play branch, because append must
+            # extend the *current* queue.
+            pick = console.input(
+                "[bold]Play which #? (aN = append to queue, Enter to skip) [/bold]"
+            )
+            pick = pick.strip().lower()
+            if pick.startswith("a") and pick[1:].isdigit():
+                n = int(pick[1:])
+                if 1 <= n <= len(results):
+                    self.queue.append(results[n - 1])
+                    console.print(
+                        f"[dim]appended \"{results[n - 1]['title']}\" — "
+                        f"queue now has {len(self.queue)} tracks[/dim]"
+                    )
+                else:
+                    console.print("[red]No such result number.[/red]")
+                return
+            if pick.isdigit() and 1 <= int(pick) <= len(results):
+                self.queue = results
+                self.index = -1  # old cursor pointed into the old queue
+                self._play_index(int(pick) - 1)
+        finally:
+            self._bar_hold = was_holding
 
     def loop(self) -> None:
         console.print(_MENU)
