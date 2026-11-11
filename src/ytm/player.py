@@ -339,8 +339,14 @@ class Player:
     @staticmethod
     def _resolve(webpage_url: str) -> str:
         """Turn a YouTube watch URL into a direct audio stream URL."""
-        with YoutubeDL(_EXTRACT_OPTIONS) as ydl:
-            info = ydl.extract_info(webpage_url, download=False)
+        try:
+            with YoutubeDL(_EXTRACT_OPTIONS) as ydl:
+                info = ydl.extract_info(webpage_url, download=False)
+        except Exception as exc:
+            # Unavailable, region-locked, removed… convert yt-dlp's many
+            # exception types into the one callers already know, keeping
+            # yt-dlp details inside this class (same policy as search).
+            raise RuntimeError(f"couldn't load stream: {exc}") from exc
         if not info or not info.get("url"):
             raise RuntimeError(f"Could not resolve a stream for {webpage_url}")
         return info["url"]

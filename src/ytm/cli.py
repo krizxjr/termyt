@@ -223,7 +223,7 @@ class Session:
             self._announce("[dim](track finished)[/dim]")
             on_end()
 
-    def _play_index(self, i: int) -> None:
+    def _play_index(self, i: int, skip_depth: int = 0) -> None:
         if self._stopping:
             return  # quit raced an auto-advance; do not resurrect playback
         self.index = i
@@ -233,7 +233,20 @@ class Session:
         # could drag while nothing is actually playing.
         if self.reporter:
             self.reporter.set_state(status="Stopped", has_track=False)
-        title = self.player.play(self.queue[i])
+        try:
+            title = self.player.play(self.queue[i])
+        except RuntimeError as exc:
+            # Unavailable/removed track. Tell the user, then skip on to
+            # the next — but only up to one full pass of the queue, so a
+            # queue of entirely dead tracks can't spin forever.
+            self._announce(f"[red]{exc}[/red]")
+            if skip_depth >= len(self.queue) - 1:
+                self._announce(
+                    "[yellow]Too many unavailable tracks — stopped.[/yellow]"
+                )
+                return
+            self._next_track(skip_depth=skip_depth + 1)
+            return
         if title is None:
             # Superseded by a newer play while resolving (rapid keys or a
             # widget action). The newer play owns state; do not print,
@@ -274,7 +287,7 @@ class Session:
         t.start()
         self._watcher = t
 
-    def _next_track(self, wrap: bool | None = None) -> None:
+    def _next_track(self, wrap: bool | None = None, skip_depth: int = 0) -> None:
         if self._stopping or not self.queue:
             return
         if wrap is None:
@@ -289,7 +302,7 @@ class Session:
         if nxt == -1:
             self._announce("[dim]End of queue.[/dim]")
             return
-        self._play_index(nxt)
+        self._play_index(nxt, skip_depth=skip_depth)
 
     def _previous_track(self) -> None:
         if not self.queue:
@@ -379,13 +392,16 @@ class Session:
             if key in ("q", "\x03"):  # \x03 is Ctrl+C
                 break
             elif key == "p":
-                was = self.player._paused
-                self._generation += 1
-                self.player.toggle()
-                self._announce(
-                    "[dim]paused[/dim]" if not was else "[dim]resumed[/dim]"
-                )
-                self._mpris_status("Paused" if not was else "Playing")
+                if self.player._current is None:
+                    self._announce("[dim]nothing playing[/dim]")
+                else:
+                    was = self.player._paused
+                    self._generation += 1
+                    self.player.toggle()
+                    self._announce(
+                        "[dim]paused[/dim]" if not was else "[dim]resumed[/dim]"
+                    )
+                    self._mpris_status("Paused" if not was else "Playing")
             elif key == "n":
                 self.stop_current()
                 self._next_track()

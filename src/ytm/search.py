@@ -47,6 +47,11 @@ def search(query: str, limit: int = 5) -> list[dict[str, str]]:
     for entry in data.get("entries") or []:
         if not entry:
             continue
+        # Skip live streams and channel entries: no duration means we
+        # can't show a seek bar, and resolving one usually errors out
+        # ("This video is unavailable") — better to never offer them.
+        if not entry.get("duration"):
+            continue
         results.append(
             {
                 "title": entry.get("title") or "Unknown title",
