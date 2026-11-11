@@ -14,6 +14,7 @@ process, and they meet only when one of them changes playback state.
 
 from __future__ import annotations
 
+import random
 import threading
 
 import readchar
@@ -31,9 +32,38 @@ console = Console()
 # far has scrolled away from the user.
 _MENU = (
     "\n[bold cyan]Controls[/bold cyan]  "
-    "p=pause/resume  n=next  b=previous  s=search  "
+    "p=pause/resume  n=next  b=previous  s=search  z=shuffle  "
     "<=seek −10s  >=seek +10s  +=/- volume  q=quit\n"
 )
+
+
+def next_index(
+    index: int,
+    length: int,
+    *,
+    shuffle: bool,
+    loop: bool,
+    rng: random.Random | None = None,
+) -> int:
+    """Decide the next queue index. -1 means "stop the queue".
+
+    Rules:
+    - shuffle ON: a random index that is NOT the current one; looping is
+      implied (shuffling into an empty "end" would be the same song over
+      and over for tiny queues — looping is the useful semantics).
+    - shuffle OFF: linear advance; wraps to 0 when `loop`, else stops (-1).
+    """
+    if length <= 0:
+        return -1
+    if length == 1:
+        return 0
+    if shuffle:
+        others = [i for i in range(length) if i != index]
+        return (rng or random).choice(others)
+    nxt = index + 1
+    if nxt >= length:
+        return 0 if loop else -1
+    return nxt
 
 
 class Session:
@@ -48,6 +78,8 @@ class Session:
         self._generation = 0  # bumped on every manual action; see _watch
         self._stopping = False  # True when the user quit the session
         self.loop_queue = True  # widget's repeat button flips this
+        self.shuffle = False  # widget's shuffle button and `z` flip this
+        self._rng = random.Random()  # swappable in tests
         self.reporter = self._start_mpris()
 
     # -- desktop (MPRIS) integration ---------------------------------------
@@ -72,6 +104,7 @@ class Session:
                 actions=actions,
                 set_volume=self._set_volume_from_desktop,
                 set_loop=self._set_loop_from_desktop,
+                set_shuffle=self._set_shuffle_from_desktop,
             )
         except RuntimeError as exc:  # no session bus: run desktop-less
             console.print(f"[dim]Desktop integration unavailable ({exc})[/dim]")
@@ -84,6 +117,14 @@ class Session:
 
     def _set_loop_from_desktop(self, on: bool) -> None:
         self.loop_queue = on  # read by _next_track's wrap logic
+
+    def _set_shuffle_from_desktop(self, on: bool) -> None:
+        self.shuffle = on
+        console.print(f"[dim]shuffle → {'on' if on else 'off'}[/dim]")
+
+    def _toggle_shuffle(self) -> None:
+        self.shuffle = not self.shuffle
+        self._set_shuffle_from_desktop(self.shuffle)  # reuse: prints + syncs
 
     def _set_volume_from_desktop(self, volume: int) -> None:
         """Desktop-sent volume: prefer instant IPC, otherwise store only."""
@@ -159,13 +200,16 @@ class Session:
             return
         if wrap is None:
             wrap = self.loop_queue
-        nxt = self.index + 1
-        if nxt >= len(self.queue):
-            if wrap:  # loop back to the top of the queue
-                nxt = 0
-            else:
-                console.print("[dim]End of queue.[/dim]")
-                return
+        nxt = next_index(
+            self.index,
+            len(self.queue),
+            shuffle=self.shuffle,
+            loop=wrap,
+            rng=self._rng,
+        )
+        if nxt == -1:
+            console.print("[dim]End of queue.[/dim]")
+            return
         self._play_index(nxt)
 
     def _previous_track(self) -> None:
@@ -241,6 +285,10 @@ class Session:
             elif key == "s":
                 self.stop_current()
                 self.do_search()
+            elif key == "z":
+                self._toggle_shuffle()
+                if self.reporter:
+                    self.reporter.set_state(shuffle=self.shuffle)
             elif key == ">":
                 # 10s forward; '<' below seeks back the same amount
                 if self.player.seek(10):

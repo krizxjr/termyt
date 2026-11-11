@@ -89,17 +89,20 @@ class _Player(ServiceInterface):
     """The playback interface: editable properties for the shell to read,
     methods for it to call. All mutations happen on the loop thread."""
 
-    def __init__(self, actions, set_volume, set_loop=lambda _on: None):
+    def __init__(self, actions, set_volume, set_loop=lambda _on: None,
+                 set_shuffle=lambda _on: None):
         super().__init__("org.mpris.MediaPlayer2.Player")
         self._actions = actions
         self._set_volume = set_volume
         self._set_loop = set_loop
+        self._set_shuffle = set_shuffle
         self.status = "Stopped"
         self.title = ""
         self.url = ""
         self.track_id = ""  # changes per track so plasma notices new songs
         self.volume = 1.0  # MPRIS uses 0..1; Player keeps 0..100
         self.loop_status = "Playlist"  # shown value; mutated by widget Set
+        self.shuffle_flag = False  # shown value; mutated by widget Set / key z
 
     def _run(self, action: str) -> None:
         fn = self._actions.get(action)
@@ -156,13 +159,16 @@ class _Player(ServiceInterface):
 
     @dbus_property(access=PropertyAccess.READWRITE)
     def Shuffle(self) -> "b":
-        return False
+        return self.shuffle_flag
 
     @Shuffle.setter
-    def Shuffle(self, wrapped) -> None:
-        # Shuffle isn't implemented yet; accept and remember so widget
-        # toggles don't error, real shuffle is a roadmap item.
-        pass
+    def Shuffle(self, value) -> None:
+        # dbus-next hands setters the already-unwrapped python value.
+        self.shuffle_flag = bool(value)
+        self.emit_properties_changed({"Shuffle": self.shuffle_flag})
+        threading.Thread(
+            target=self._set_shuffle, args=(self.shuffle_flag,), daemon=True
+        ).start()
 
     @dbus_property(access=PropertyAccess.READ)
     def Rate(self) -> "d":
@@ -234,14 +240,17 @@ class _Player(ServiceInterface):
 class Reporter:
     """Owns the D-Bus thread; the Session thread only calls set_state."""
 
-    def __init__(self, actions, set_volume, set_loop=lambda _on: None):
+    def __init__(self, actions, set_volume, set_loop=lambda _on: None,
+                 set_shuffle=lambda _on: None):
         self._actions = actions
         self._set_volume = set_volume
         self._set_loop = set_loop
+        self._set_shuffle = set_shuffle
         self._ready = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._bus: MessageBus | None = None
-        self._player = _Player(actions, set_volume, self._set_loop)
+        self._player = _Player(actions, set_volume, self._set_loop,
+                               self._set_shuffle)
         self._thread = threading.Thread(target=self._run_bus, daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout=5):
@@ -282,6 +291,7 @@ class Reporter:
         url: str | None = None,
         volume: int | None = None,
         has_track: bool | None = None,
+        shuffle: bool | None = None,
     ) -> None:
         """Update MPRIS-visible state from any thread."""
         if not self._alive or not self._ready.is_set():
@@ -292,6 +302,7 @@ class Reporter:
             "url": url,
             "volume": None if volume is None else max(0.0, min(1.0, volume / 100)),
             "has_track": has_track,
+            "shuffle": shuffle,
         }
         if self._loop:
             self._loop.call_soon_threadsafe(self._apply, payload)
@@ -309,6 +320,9 @@ class Reporter:
         if payload["volume"] is not None:
             p.volume = payload["volume"]
             changed["Volume"] = p.volume
+        if payload["shuffle"] is not None:
+            p.shuffle_flag = bool(payload["shuffle"])
+            changed["Shuffle"] = p.shuffle_flag
         if payload["status"] is not None:
             p.status = payload["status"]
             changed["PlaybackStatus"] = p.status
