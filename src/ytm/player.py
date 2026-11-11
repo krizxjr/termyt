@@ -72,6 +72,12 @@ class Player:
         # that leaked a second playing mpv. RLock because transitions
         # legitimately nest (play calls stop; seek calls pause/resume).
         self._lock = threading.RLock()
+        # Token pattern for play(): the stream resolve is a multi-second
+        # NETWORK call and must NOT hold the lock (that blocked stop and
+        # made rapid keypresses queue up into an endless skip chain).
+        # Instead we take a token, resolve unlocked, then re-check: if
+        # anything else played/stopped meanwhile, our spawn is abandoned.
+        self._play_token = 0
 
     @property
     def current(self) -> dict[str, str] | None:
@@ -83,13 +89,26 @@ class Player:
         """True when sound is coming out right now (not paused, not ended)."""
         return self._proc is not None and not self._paused and self._poll() is None
 
-    def play(self, entry: dict[str, str], volume: int | None = None) -> str:
-        """Start playing `entry`; stop whatever was playing first."""
+    def play(self, entry: dict[str, str], volume: int | None = None) -> str | None:
+        """Start playing `entry`; stop whatever was playing first.
+
+        Returns the title on success, or None when this play was
+        superseded by a newer one while the stream was being resolved —
+        callers must treat None as "your request was overtaken" and not
+        touch state they were about to set up (watchers, broadcasts).
+        """
         with self._lock:
-            self.stop()
+            self._stop_locked()
             if volume is not None:
                 self._volume = volume
-            stream_url = self._resolve(entry["url"])
+            self._play_token += 1
+            token = self._play_token
+
+        stream_url = self._resolve(entry["url"])  # network: NOT under lock
+
+        with self._lock:
+            if token != self._play_token:
+                return None  # superseded: do NOT spawn
             args = [
                 "mpv",
                 "--no-video",
@@ -171,29 +190,52 @@ class Player:
                 self.pause()
 
     def stop(self) -> None:
-        """End playback and reap the child process."""
+        """End playback and reap the child process (public, locked)."""
         with self._lock:
-            if self._proc is None:
-                self._current = None
-                return
-            if self._poll() is None:  # still running: kill it
-                if self._paused:  # a stopped process can't receive SIGTERM
+            self._play_token += 1  # invalidate any in-flight resolve
+            self._stop_locked()
+
+    def force_kill(self) -> None:
+        """Last-resort teardown (SIGKILL), used when a graceful stop got
+        interrupted (e.g. by a second Ctrl+C during quit)."""
+        with self._lock:
+            self._play_token += 1  # invalidate any in-flight resolve
+            if self._proc is not None and self._poll() is None:
+                if self._paused:  # stopped procs ignore SIGKILL delivery
                     self.resume()
-                self._proc.terminate()
+                self._proc.kill()
                 try:
                     self._proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:  # stubborn child
-                    self._proc.kill()
-                    self._proc.wait()
+                except subprocess.TimeoutExpired:
+                    pass  # un-reapable; the OS will finish it
             self._proc = None
             self._current = None
             self._paused = False
-            if self._ipc_path and self._ipc_path.exists():  # socket cleanup
-                try:
-                    self._ipc_path.unlink()
-                except OSError:
-                    pass  # a leftover file in /tmp is harmless
             self._ipc_path = None
+
+    def _stop_locked(self) -> None:
+        """stop() body; caller must hold the lock."""
+        if self._proc is None:
+            self._current = None
+            return
+        if self._poll() is None:  # still running: kill it
+            if self._paused:  # a stopped process can't receive SIGTERM
+                self.resume()
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:  # stubborn child
+                self._proc.kill()
+                self._proc.wait()
+        self._proc = None
+        self._current = None
+        self._paused = False
+        if self._ipc_path and self._ipc_path.exists():  # socket cleanup
+            try:
+                self._ipc_path.unlink()
+            except OSError:
+                pass  # a leftover file in /tmp is harmless
+        self._ipc_path = None
 
     def _poll(self) -> int | None:
         """Child's exit code, or None if still running."""

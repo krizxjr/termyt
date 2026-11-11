@@ -163,9 +163,16 @@ class Session:
             on_end()
 
     def _play_index(self, i: int) -> None:
+        if self._stopping:
+            return  # quit raced an auto-advance; do not resurrect playback
         self.index = i
         self._generation += 1
         title = self.player.play(self.queue[i])
+        if title is None:
+            # Superseded by a newer play while resolving (rapid keys or a
+            # widget action). The newer play owns state; do not print,
+            # broadcast, or start a watcher for a proc we never spawned.
+            return
         console.print(f"[green]▶[/green] {i + 1}/{len(self.queue)} {title}")
         self._mpris_status("Playing")
         self._start_watcher()
@@ -202,7 +209,7 @@ class Session:
         self._watcher = t
 
     def _next_track(self, wrap: bool | None = None) -> None:
-        if not self.queue:
+        if self._stopping or not self.queue:
             return
         if wrap is None:
             wrap = self.loop_queue
@@ -335,10 +342,19 @@ class Session:
         self._mpris_status("Stopped")
 
     def quit(self) -> None:
-        """Persist the session, then shut down playback."""
+        """Persist the session, then shut down playback.
+
+        _stopping goes FIRST so in-flight auto-advances die instantly.
+        If a graceful stop gets interrupted (second Ctrl+C while the
+        lock is contended), we come back with SIGKILL — the one outcome
+        that must never fail is "quitting leaves silence".
+        """
+        self._stopping = True
         state.save(self.queue, index=self.index, volume=self.player._volume)
         if self.reporter:
             self.reporter.stop()
-        self._stopping = True
         self._generation += 1
-        self.player.stop()
+        try:
+            self.player.stop()
+        except KeyboardInterrupt:
+            self.player.force_kill()
